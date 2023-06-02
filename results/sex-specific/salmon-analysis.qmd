@@ -1,0 +1,481 @@
+---
+title: "Salmon RNA-seq analysis"
+author: "JH"
+format:
+  html:
+    code-fold: true
+editor: visual
+---
+
+## Salmon RNA-seq analysis
+
+```{r}
+#| label: setup
+#| include: false
+library(tidyverse)
+library(tximport)
+library(knitr)
+library(ggrepel)
+library(pheatmap)
+library(cowplot)
+library(here)
+library(glue)
+```
+
+## Quality Control
+
+```{r}
+#| label: biomart
+#| message: false
+library(biomaRt)
+host <- 'https://useast.ensembl.org'
+
+mart <- biomaRt::useMart(
+  "ENSEMBL_MART_ENSEMBL",
+  dataset = "dmelanogaster_gene_ensembl",
+  host = host
+)
+
+t2g_all <- biomaRt::getBM(
+  attributes = c(
+    'ensembl_transcript_id',
+    'ensembl_gene_id',
+    'external_gene_name'
+    ),
+  mart = mart) |>
+  as_tibble()
+
+geneid2name <- dplyr::select(
+  t2g_all, ensembl_gene_id, ensembl_transcript_id
+)
+
+t2g <- dplyr::select(
+  t2g_all, ensembl_transcript_id, ensembl_gene_id
+)
+```
+
+### Load data
+
+```{r}
+#| label: load_salmon
+#| message: false
+sex <- c('Male', 'Female')
+tissue <- c('Br', 'FB')
+rep <- 1:3
+
+file_info <- expand_grid(sex, tissue, rep) |>
+  mutate(
+    sample = glue::glue('{sex}{tissue}_{rep}'),
+    paths = here::here('results', 'sex-specific', 'salmon-quant', str_c(sample, '_out'), 'quant.sf.gz')
+  )
+
+file_paths <- file_info$paths
+names(file_paths) <- file_info$sample
+
+txi <- tximport(
+  file_paths,
+  type = 'salmon',
+  tx2gene = t2g,
+  dropInfReps = TRUE,
+  countsFromAbundance = 'lengthScaledTPM'
+)
+
+tpms <- txi$abundance |>
+  as.data.frame () |>
+  rownames_to_column(var = 'ensembl_gene_id') |>
+  as_tibble()
+```
+
+### Heatmap to examine relationship between samples
+
+Sanity check, these should sum to \~1e6 (because they are TPM, "per-million").
+
+```{r}
+#| label: qc
+sum(tpms$MaleBr_1)
+sum(tpms$MaleBr_2)
+sum(tpms$MaleBr_3)
+```
+
+```{r}
+#| label: cutoffs
+# filter for rows where there is data for at least have the samples 
+tpms.cutoff <- mutate(
+  tpms,
+  n_samples = rowSums(tpms[,2:ncol(tpms)] > 1)
+  ) |>
+  filter(n_samples >= round(ncol(tpms) / 2)) |>
+  dplyr::select(-n_samples)
+
+tpms.cutoff.matrix <- dplyr::select(tpms.cutoff, -ensembl_gene_id) |>
+  as.matrix()
+
+tpms.cor <- cor(tpms.cutoff.matrix, method = 'spearman')
+
+library(pheatmap)
+pheatmap(tpms.cor)
+```
+
+```{r}
+#| label: pca
+tpms.cutoff.matrix <- dplyr::select(tpms.cutoff, -ensembl_gene_id) %>%
+  as.matrix()
+
+# Add pseudocount so we can log the values
+tpms.cutoff.matrix <- tpms.cutoff.matrix + 1e-3
+
+# Take log of values
+tpms.cutoff.matrix <- log(tpms.cutoff.matrix)
+
+tpms.pca <- prcomp(t(tpms.cutoff.matrix))
+tpms.pca.summary <- summary(tpms.pca)$importance
+
+tpms.pca.pc <- tpms.pca$x |>
+  as.data.frame() |>
+  rownames_to_column('sample') |>
+  as_tibble() |>
+  separate(sample, into = c('sample', 'rep'), sep = '_') |>
+  separate(sample, into = c('sex', 'tissue'), sep = -2)
+
+pc1_var <- round(tpms.pca.summary[2,1] * 100, 1)
+pc2_var <- round(tpms.pca.summary[2,2] * 100, 1)
+  
+ggplot(
+  tpms.pca.pc,
+  aes(x = PC1, y = PC2, color = sex, shape = tissue)) +
+  geom_point(size = 10, alpha = 0.4) +
+  theme_minimal_grid() +
+  scale_color_brewer(palette = 'Dark2') +
+  labs(
+    title = 'PCA analysis of FB / Brain RNA-seq samples',
+    x = glue('PC1 ({pc1_var}% of variance explained)'),
+    y = glue('PC2 ({pc2_var}% of variance explained)')
+  )
+
+```
+
+## Differential Expression
+
+```{r}
+#| label: deseq_analysis
+library(DESeq2)
+
+sample_info <- dplyr::select(file_info, sample, sex, tissue, rep) |>
+  mutate(
+    sex = as.factor(sex),
+    tissue = as.factor(tissue),
+    rep = as.factor(rep)) |>
+  column_to_rownames('sample')
+
+ddsTxi <- DESeqDataSetFromTximport(
+  txi,
+  colData = sample_info,
+  design = ~ rep + tissue + sex
+)
+
+dds <- DESeq(ddsTxi)
+```
+
+### Sex-biased
+
+```{r}
+sex.results <- results(dds, contrast = c('sex', 'Male', 'Female')) |>
+  as.data.frame() |>
+  rownames_to_column(var = 'ensembl_gene_id') |>
+  as_tibble() |>
+  # Merge this with a table relating ensembl_gene_id with gene short names
+  inner_join(
+    unique(dplyr::select(t2g, -ensembl_transcript_id)),
+    by = 'ensembl_gene_id')
+```
+
+```{r}
+#number of upregulated genes
+filter(sex.results, padj < 0.01 & log2FoldChange > 0) |> nrow()
+#number of downregulated genes
+filter(sex.results, padj < 0.01 & log2FoldChange < 0) |> nrow()
+```
+
+```{r}
+sex.results.sig <- mutate(
+  sex.results,
+  sig = ifelse(padj < 0.01, 'yes', 'no')
+) |>
+  #if a gene did not meet expression cutoffs that DESeq2 automatically does, it gets a pvalue of NA
+  na.omit()
+
+ggplot(
+  sex.results.sig,
+  aes(
+    x = log2FoldChange,
+    y = -log10(padj),
+    color = sig
+  )
+) +
+  geom_point(alpha = 0.2) +
+  theme_minimal_grid() +
+  scale_color_manual(
+    values = c('gray', 'red'),
+    labels = c('NS', 'FDR < 0.01'),
+    name = ''
+    ) +
+  theme(legend.position = c(0.8, 0.5)) +
+  guides(color = guide_legend(override.aes = list(alpha = 1))) +
+  labs(
+    x = 'Male expression / Female expression, log2',
+    y = '-log10(FDR)',
+    title = 'Volcano plot of sex-biased gene expression'
+  )
+```
+
+```{r}
+#| label: deseq_lfc_cutoff
+sex.results.lfc <- results(
+  dds,
+  contrast = c('sex', 'Male', 'Female'),
+  lfcThreshold = log(3, 2)
+  ) |>
+  as.data.frame() |>
+  rownames_to_column(var = 'ensembl_gene_id') |>
+  dplyr::select(-c(baseMean, lfcSE, stat, pvalue)) |>
+  inner_join(
+    unique(dplyr::select(t2g, -ensembl_transcript_id)),
+    .,
+    by = 'ensembl_gene_id'
+    ) |>
+  mutate(
+    sig = ifelse(padj < 0.01, 'yes', 'no')
+    ) |>
+  na.omit()
+
+#number of upregulated genes
+filter(sex.results.lfc, padj < 0.01 & log2FoldChange > 0) |> nrow()
+
+#number of downregulated genes
+filter(sex.results.lfc, padj < 0.01 & log2FoldChange < 0) |> nrow()
+
+ggplot(
+  sex.results.lfc,
+  aes(
+    x = log2FoldChange,
+    y = -log10(padj),
+    color = sig)) + 
+  geom_point(alpha = 0.2) +
+  theme_classic(16) +
+  scale_color_manual(
+    values = c('gray', 'red'),
+    labels = c('NS', 'FDR < 0.01'),
+    name = '') +
+  theme(legend.position = c(0.8, 0.5)) +
+  guides(
+    color = guide_legend(override.aes = list(alpha = 1))
+  ) +
+  labs(
+    x = 'Male expression / Female expression, log2',
+    y = '-log10(FDR)',
+    title = 'Volcano plot of sex-biased gene expression',
+    subtitle = 'fold cutoff of log2(3)'
+  )
+
+```
+
+What are these genes?
+
+```{r}
+sex_res_filtered <- 
+  filter(sex.results.lfc, sig == 'yes') |>
+  arrange(-log2FoldChange) |>
+  mutate(
+    log2FoldChange = round(log2FoldChange, 3),
+    padj = round(padj, 10)
+  ) |>
+  left_join(t2g_all) |>
+  dplyr::select(ensembl_gene_id, external_gene_name, log2FoldChange, padj) |>
+  as_tibble()
+
+DT::datatable(sex_res_filtered)
+```
+
+```{r}
+# now let's join the filtered sex results with the tpms to inspect tissues
+left_join(sex_res_filtered, tpms)
+```
+
+## Analyze FB alone
+
+```{r}
+#| label: deseq_analysis
+library(DESeq2)
+
+file_info_fb <- file_info |> filter(tissue == 'FB')
+file_paths <- file_info_fb |> pull(paths)
+names(file_paths) <- file_info |> filter(tissue == 'FB') |> pull(sample)
+
+txi_fb <- tximport(
+  file_paths,
+  type = 'salmon',
+  tx2gene = t2g,
+  dropInfReps = TRUE,
+  countsFromAbundance = 'lengthScaledTPM'
+)
+
+tpms_fb <- txi_fb$abundance |>
+  as.data.frame () |>
+  rownames_to_column(var = 'ensembl_gene_id') |>
+  as_tibble()
+
+tpms_fb_long <-
+  pivot_longer(tpms_fb, -ensembl_gene_id)
+
+sample_info_fb <- dplyr::select(file_info_fb, sample, sex, tissue, rep) |>
+  mutate(
+    sex = as.factor(sex),
+    rep = as.factor(rep)) |>
+  column_to_rownames('sample')
+
+ddsTxi_fb <- DESeqDataSetFromTximport(
+  txi_fb,
+  colData = sample_info_fb,
+  design = ~ rep + sex
+)
+
+dds_fb <- DESeq(ddsTxi_fb)
+
+sex_lfc_fb <- results(
+  dds_fb,
+  contrast = c('sex', 'Male', 'Female'),
+  # lfcThreshold = log(3, 2)
+  ) |>
+  as.data.frame() |>
+  rownames_to_column(var = 'ensembl_gene_id') |>
+  dplyr::select(-c(baseMean, lfcSE, stat, pvalue)) |>
+  inner_join(
+    unique(dplyr::select(t2g, -ensembl_transcript_id)),
+    .,
+    by = 'ensembl_gene_id'
+    ) |>
+  mutate(
+    sig = ifelse(padj < 0.01, 'yes', 'no')
+    ) |>
+  na.omit()
+```
+
+### Write expression table
+
+```{r}
+sex_lfc_fb |>
+  as_tibble() |>
+  left_join(t2g_all) |> 
+  dplyr::select(starts_with('ensembl'), external_gene_name, everything(), -sig) |>
+  arrange(log2FoldChange) |>
+  write_tsv(file = 'Male_over_Female_FB_DEseq2.tsv.gz')
+```
+
+
+### Sanity checking values from the pre-print
+
+```{r eval=FALSE}
+#number of upregulated genes
+filter(sex_lfc_fb, padj < 0.01 & log2FoldChange > 0) |> nrow()
+
+#number of downregulated genes
+filter(sex_lfc_fb, padj < 0.01 & log2FoldChange < 0) |> nrow()
+
+# up in female FB
+left_join(sex_lfc_fb, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_name, everything()) |> filter(external_gene_name == 'CG44476')
+# up in male FB
+left_join(sex_lfc_fb, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_name, everything()) |> filter(external_gene_name == 'CG8097')
+
+# up in male
+left_join(sex_lfc_fb, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_name, everything()) |> filter(external_gene_name == 'CG4836')
+# up (maginally) in female
+left_join(sex_lfc_fb, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_name, everything()) |> filter(external_gene_name == 'CG32803')
+```
+
+```{r}
+#remake 2E and S2 with salmon data
+fb_fc_tab <- sex_lfc_fb |>
+  as_tibble() |>
+  left_join(t2g_all) |>
+  filter(padj <= 0.01) |>
+  arrange(-log2FoldChange) |>
+  left_join(tpms_fb) |>
+  dplyr::select(gene_name = external_gene_name, starts_with('Female'), starts_with('Male')) |>
+  unique()
+
+top_25_tbl <- bind_rows(
+  slice_head(fb_fc_tab, n = 25),
+  slice_tail(fb_fc_tab, n = 25)
+)
+
+top_25_log_tbl <-
+  pivot_longer(top_25_tbl, -gene_name) |>
+  mutate(value = value + 1e-3, value = log2(value)) |>
+  pivot_wider()
+
+top_25_mat <- dplyr::select(top_25_tbl, -gene_name) |> as.data.frame() |> as.matrix()
+rownames(top_25_mat) <- top_25_tbl$gene_name
+
+top_25_log_mat <- dplyr::select(top_25_log_tbl, -gene_name) |> as.data.frame() |> as.matrix()
+rownames(top_25_log_mat) <- top_25_tbl$gene_name
+
+top_100_tbl <- bind_rows(
+  slice_head(fb_fc_tab, n = 100),
+  slice_tail(fb_fc_tab, n = 100)
+)
+
+top_100_mat <- dplyr::select(top_100_tbl, -gene_name) |> as.data.frame() |> as.matrix()
+rownames(top_100_mat) <- top_100_tbl$gene_name
+
+pheatmap(
+  top_25_mat,
+  scale = 'row',
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_colnames = FALSE,
+  colorRampPalette(c("#ef8a62", "#f7f7f7", "#67a9cf"))(50),
+  width = 4, height = 7,
+  filename = 'Fig_2E_MaleFemale_FB_exp_heatmap_top25.png'
+)
+
+pheatmap(
+  top_100_mat,
+  scale = 'row',
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  show_colnames = FALSE,
+  colorRampPalette(c("#ef8a62", "#f7f7f7", "#67a9cf"))(50),
+  width = 4, height = 15,
+  fontsize_row = 4,
+  filename = 'Fig_S2_MaleFemale_FB_exp_heatmap_top100.png'
+)
+```
+
+
+## Summary
+
+## paper checking
+
+Sanity checks for the pre-print: https://www.biorxiv.org/content/10.1101/2023.02.17.528952v1.full
+
+Checked several genes from Fig S2 and the patterns hold up.
+
+```{r}
+# up in female FB
+left_join(tpms, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_name, everything()) |> filter(external_gene_name == 'CG44476')
+# up in male FB
+left_join(tpms, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_name, everything()) |> filter(external_gene_name == 'CG8097')
+```
+
+Checked Fig 1E 
+
+```{r}
+# up in male
+left_join(tpms, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_name, everything()) |> filter(external_gene_name == 'CG4836')
+# up (maginally) in female
+left_join(tpms, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_name, everything()) |> filter(external_gene_name == 'CG32803')
+```
+
+The vast majority (all?) of the DE genes (at padj <= 0.01) are up in the *male FB* samples, specifically.
+
+So, a lot of the top genes are "expressed in spermatozoon", possibly indicating contamination of the fat body tissue with gonadal tissue and plausibly accounting for the major differences in expression between male and female FB tissue.
