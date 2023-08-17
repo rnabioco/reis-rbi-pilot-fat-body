@@ -9,9 +9,8 @@
 
 set -o nounset -o pipefail -o errexit -x
 
-samples=(FemaleBr_1 FemaleBr_2 FemaleBr_3
+samples=(
     FemaleFB_1 FemaleFB_2 FemaleFB_3
-    MaleBr_1 MaleBr_2 MaleBr_3
     MaleFB_1 MaleFB_2 MaleFB_3)
 
 sample=${samples[$(($LSB_JOBINDEX - 1))]}
