@@ -60,7 +60,7 @@ t2g <- dplyr::select(
 #| label: load_salmon
 #| message: false
 sex <- c('Male', 'Female')
-tissue <- c('Br', 'FB')
+tissue <- c('FB')
 rep <- 1:3
 
 file_info <- expand_grid(sex, tissue, rep) |>
@@ -89,13 +89,6 @@ tpms <- txi$abundance |>
 ### Heatmap to examine relationship between samples
 
 Sanity check, these should sum to \~1e6 (because they are TPM, "per-million").
-
-```{r}
-#| label: qc
-sum(tpms$MaleBr_1)
-sum(tpms$MaleBr_2)
-sum(tpms$MaleBr_3)
-```
 
 ```{r}
 #| label: cutoffs
@@ -147,7 +140,7 @@ ggplot(
   theme_minimal_grid() +
   scale_color_brewer(palette = 'Dark2') +
   labs(
-    title = 'PCA analysis of FB / Brain RNA-seq samples',
+    title = 'PCA analysis of FB RNA-seq samples',
     x = glue('PC1 ({pc1_var}% of variance explained)'),
     y = glue('PC2 ({pc2_var}% of variance explained)')
   )
@@ -477,5 +470,3 @@ left_join(tpms, t2g_all) |> dplyr::select(starts_with('ensembl'), external_gene_
 ```
 
 The vast majority (all?) of the DE genes (at padj <= 0.01) are up in the *male FB* samples, specifically.
-
-So, a lot of the top genes are "expressed in spermatozoon", possibly indicating contamination of the fat body tissue with gonadal tissue and plausibly accounting for the major differences in expression between male and female FB tissue.
